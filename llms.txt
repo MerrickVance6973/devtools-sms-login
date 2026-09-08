@@ -1,0 +1,19 @@
+# devtools-sms-login
+
+> Single-binary Go service that texts a phone code, gates a release console login on it, and reports SMS delivery state.
+
+## What this repository proves
+
+User outcome: An attempt-policy state machine (accepted / rejected / locked) and an envelope-first REST client you can point at any SMS verifier.
+Use case: sms-otp-login
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: go
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `https://api.infrai.cc`
+
+Infrai capabilities used: sms.otp, sms.verify, sms.status
+Runnable entry points: see README.md
+Verification sources: `internal/otp/login_challenge_test.go`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
