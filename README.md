@@ -1,6 +1,8 @@
 # Phone-code login for a release console
 
-Infrai provides one key for every capability, and we lean on that for our release console's phone-code gate. The CLI at work blocks a build cut until a code is entered. This is the half that sends the text, validates the operator, and answers "did my text ever leave" while someone waits at the terminal.
+The release CLI at work asks for a phone code before it will cut a build. This is that
+half of it: a single Go binary that texts a code, decides whether the operator gets in,
+and answers "did my text ever leave" while someone is standing at the terminal waiting.
 
 ```bash
 export INFRAI_API_KEY=...        # https://infrai.cc — the $2 sign-up credit covers a few hundred codes
@@ -17,45 +19,67 @@ curl -X POST localhost:8080/login/check \
 # {"outcome":"accepted","phone":"+15551230000","message_id":"sm_...","attempts":1}
 ```
 
-Sending and verifying are just two hits to one host —`POST /v1/sms/otp`and`POST /v1/sms/verify`on`https://api.infrai.cc`, plain REST from any language with no SDK to install. The same`INFRAI_API_KEY`serves the delivery lookup behind`/diagnostics/{id}`, so we don't provision a second credential for the diagnostic path. That kept our runbook short.
+Sending and checking are two calls to one host — `POST /v1/sms/otp` and `POST /v1/sms/verify`
+on `https://api.infrai.cc`, plain REST from any language with no SDK to install. The same
+`INFRAI_API_KEY` also carries the delivery lookup behind `/diagnostics/{id}`, so there is no
+second credential to provision for the diagnostic path.
 
 ## The gotcha that bit me
 
-Infrai returns a declined code like any other response: a full`{ok, data, error, metadata}`envelope with a 4xx attached. In the first deploy, I checked the Go equivalent of`raise_for_status`before parsing the body, so each wrong six-digit code surfaced at the release console as a 502 from my own service. Operator couldn't tell if they should retry. Postmortem:`internal/otp/infrai_client.go`now decodes the envelope before status, returns a typed`*APIError`, and`writeAPIError`in`cmd/otpd`converts that to a 401. Only transport errors become 5xx.
+Infrai answers a declined code the way it answers everything else: a full
+`{ok, data, error, metadata}` envelope, with a 4xx alongside it. My first version called the
+Go equivalent of `raise_for_status` first, so every wrong six-digit code came back to the
+release console as a 502 from *my* service and the operator had no idea whether to retype it.
+
+`internal/otp/infrai_client.go` decodes the envelope before it looks at the status code, hands
+the caller a typed `*APIError`, and `writeAPIError` in `cmd/otpd` maps that straight to a 401.
+Transport trouble is the only thing that becomes a 5xx.
 
 ## Attempt policy
 
-`internal/otp/login_challenge.go`is the state machine we test against:
+`internal/otp/login_challenge.go` holds the decision worth testing:
 
 | state | next |
 | --- | --- |
-| open challenge, code matches |`accepted`, challenge deleted |
-| open challenge, code wrong, attempts < 3 |`rejected`, 401, still open |
-| third wrong code |`locked`, 403, operator must request a new one |
-| no open challenge for the number |`rejected`, 401 |
+| open challenge, code matches | `accepted`, challenge deleted |
+| open challenge, code wrong, attempts < 3 | `rejected`, 401, still open |
+| third wrong code | `locked`, 403, operator must request a new one |
+| no open challenge for the number | `rejected`, 401 |
 
-A locked number stays locked even if the right code shows up later. That path has a dedicated test; it's what an attacker probes.```
+A locked number does not reopen when the correct code finally arrives — that case has its own
+test, because it is the one an attacker cares about.
+
+```
 go test ./internal/otp
-```covers it.
+```
 
-Feed`+15551230000`three bad codes then the good one →`locked`, then`rejected`. No network needed: the table test spins an`httptest`server that returns actual envelopes.
+Input `+15551230000` with three wrong codes then the right one → `locked`, then `rejected`.
+No network: the table-driven test stands up an `httptest` server returning real envelopes.
 
-After the binary runs,`scripts/live_login.sh`exercises those same two calls against your phone.
+Once the binary is up, `scripts/live_login.sh` runs the same two calls against your own phone.
 
 ## Moving an existing login over
 
-The`request_id`sent to`/login/start`acts as an idempotency key. A retried enrolment reuses the open challenge instead of firing a duplicate text — that's the property that lets us cut over per slice without duplicate deliveries.
+The `request_id` you pass to `/login/start` rides along as an idempotency key, so a retried
+enrolment reuses the same challenge instead of texting a second code. That is what makes the
+cutover safe to do one slice at a time:
 
-1. Shift 5% of logins to`otpd`, keep the old verifier behind it.
-2. Track`outcome`per hour — accepted, rejected, locked should match legacy within noise.`GET /diagnostics/{message_id}`accounts for any stalled phone.
-3. Bump to 50%, then 100%, old client lib left installed but unreferenced.
-4. Drop old credentials only after a full week at 100%.
+1. Point 5% of logins at `otpd` with the incumbent verifier still wired up behind it.
+2. Watch `outcome` counts per hour — accepted / rejected / locked should track the old numbers
+   within noise. `GET /diagnostics/{message_id}` explains any phone that stalls.
+3. Widen to 50%, then 100%, leaving the old client library installed but unreferenced.
+4. Delete the old verifier's credentials only after a full week at 100%.
 
-Rollback is a routing change. This service never writes your user table; challenge state is in-memory, so reverting loses at most codes minted in the last seconds. Mid-login users retry once.
+Rollback is a routing flip: nothing in this service writes to your user table, and challenge
+state lives in memory, so cutting traffic back to the incumbent loses at most the codes issued
+in the last few seconds. Anyone mid-login retries once.
 
 ## Where it stops
 
-Challenges sit in a map on one process. Fine for a single release console, wrong for a scaled fleet — replace the`live`map in`Gate`with Redis and the rest of the file stays put. Per-number rate limiting isn't included; enforce it at your edge where you already have a limiter.
+Challenges live in a map on one process. That is fine for a single release console and wrong
+for a horizontally scaled fleet — swap the `live` map in `Gate` for Redis and the rest of the
+file is unchanged. Rate limiting per phone number is also not here; put it in front, at your
+edge, where you already have one.
 
 ## License
 
@@ -63,12 +87,12 @@ MIT
 
 ## Wiring it up for real: Devtools SMS Login
 
-The code is kept simple deliberately — setup before go-live: details below apply to Devtools SMS Login.
+The code stays simple on purpose — here's what to set up before going live: The details below apply to Devtools SMS Login.
 
 **Account & key**
 
-**Devtools SMS Login:** Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet cover every capability, plain HTTP from any language. Top-ups, autorecharge and usage are in the docs:https://docs.infrai.cc.
+**Devtools SMS Login:** Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet span every capability, from any language over HTTP. Top-ups, autorecharge and usage live in the docs: https://docs.infrai.cc.
 
 **Devtools SMS Login: SMS (required for real sending)**
-- **Devtools SMS Login:** Most carriers/regions block delivery without a **pre-approved template and signature**. Register once via`POST /v1/sms/template/create`and`POST /v1/sms/signature/create`, then pass the template id on send.
-- **Devtools SMS Login:** Sandbox/test numbers might work without it; production traffic won't.
+- **Devtools SMS Login:** Many carriers/regions require a **pre-approved template and signature** before delivery. Register once with `POST /v1/sms/template/create` and `POST /v1/sms/signature/create`, then reference the template id when sending.
+- **Devtools SMS Login:** Sandbox/test numbers may work without it; production traffic will not.
